@@ -72,6 +72,12 @@ class Args:
     critic_depth: int = 4
     actor_skip_connections: int = 0 # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
     critic_skip_connections: int = 0 # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
+
+    transformer: bool = False
+    tr_critic_width: int = 256
+    tr_critic_num_heads: int = 8
+    tr_critic_mlp_dim: int = 1024
+    tr_critic_n_layers: int = 4
     
     num_episodes_per_env: int = 1 #recommended to keep at 1
     training_steps_multiplier: int = 1 #recommended to keep at 1
@@ -192,6 +198,140 @@ class G_encoder(nn.Module):
         x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
   
+class TransformerBlock(nn.Module):
+    d_model: int
+    num_heads: int
+    mlp_dim: int
+    use_relu: int = 0
+    
+    @nn.compact
+    def __call__(self, x):
+        lecun_uniform = variance_scaling(1/3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+        activation = nn.relu if self.use_relu else nn.swish
+        
+        # 1. Self-Attention Block
+        residual = x
+        x = nn.LayerNorm()(x)
+        x = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            kernel_init=lecun_uniform,
+            bias_init=bias_init
+        )(x, x)
+        x = x + residual
+        
+        # 2. MLP Block
+        residual = x
+        x = nn.LayerNorm()(x)
+        x = nn.Dense(self.mlp_dim, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = activation(x)
+        x = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init)(x)
+        x = x + residual
+        
+        return x
+
+class SA_TransformerEncoder(nn.Module):
+    d_model: int = 512
+    num_heads: int = 8
+    num_layers: int = 1
+    mlp_dim: int = 2048
+    use_relu: int = 0
+    
+    @nn.compact
+    def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
+        lecun_uniform = variance_scaling(1/3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+        
+        # 1. Project states and actions into a shared dimensional space
+        s_proj = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init)(s)
+        a_proj = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init)(a)
+        
+        # Expand dims to create sequence axes: (..., 1, d_model)
+        s_seq = jnp.expand_dims(s_proj, axis=-2)
+        a_seq = jnp.expand_dims(a_proj, axis=-2)
+        
+        # 2. Setup the [CLS] Token
+        # Extract batch dimensions to properly broadcast the learned token
+        batch_shape = s_seq.shape[:-2]
+        cls_token = self.param('cls_token', nn.initializers.zeros, (1, 1, self.d_model))
+        cls_token = jnp.broadcast_to(cls_token, (*batch_shape, 1, self.d_model))
+        
+        # Concatenate into sequence: (..., 3, d_model) -> [CLS, state, action]
+        x = jnp.concatenate([cls_token, s_seq, a_seq], axis=-2)
+        
+        # 3. Add Positional Embeddings
+        # Crucial so the transformer can distinguish between the state and action token
+        pos_emb = self.param('pos_emb', nn.initializers.normal(stddev=0.02), (1, 3, self.d_model))
+        x = x + pos_emb
+        
+        # 4. Apply Transformer Blocks
+        for _ in range(self.num_layers):
+            x = TransformerBlock(
+                d_model=self.d_model, 
+                num_heads=self.num_heads, 
+                mlp_dim=self.mlp_dim, 
+                use_relu=self.use_relu
+            )(x)
+            
+        # 5. Output Extraction
+        # Extract the processed representation of the [CLS] token (index 0)
+        cls_out = x[..., 0, :]
+        
+        # 6. Final Layer Projection (identical to original)
+        out = nn.Dense(64, kernel_init=lecun_uniform, bias_init=bias_init)(cls_out)
+        
+        return out
+
+class G_TransformerEncoder(nn.Module):
+    d_model: int = 512
+    num_heads: int = 8
+    num_layers: int = 1
+    mlp_dim: int = 2048
+    use_relu: int = 0
+    
+    @nn.compact
+    def __call__(self, g: jnp.ndarray):
+        lecun_uniform = variance_scaling(1/3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+        
+        # 1. Project the goal into the shared dimensional space
+        g_proj = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init)(g)
+        
+        # Expand dims to create the sequence axis: (..., 1, d_model)
+        g_seq = jnp.expand_dims(g_proj, axis=-2)
+        
+        # 2. Setup the [CLS] Token
+        # Extract batch dimensions to properly broadcast the learned token
+        batch_shape = g_seq.shape[:-2]
+        cls_token = self.param('cls_token', nn.initializers.zeros, (1, 1, self.d_model))
+        cls_token = jnp.broadcast_to(cls_token, (*batch_shape, 1, self.d_model))
+        
+        # Concatenate into a length-2 sequence: (..., 2, d_model) -> [CLS, goal]
+        x = jnp.concatenate([cls_token, g_seq], axis=-2)
+        
+        # 3. Add Positional Embeddings
+        # Note: sequence length is 2 here, compared to 3 in the SA_encoder
+        pos_emb = self.param('pos_emb', nn.initializers.normal(stddev=0.02), (1, 2, self.d_model))
+        x = x + pos_emb
+        
+        # 4. Apply Transformer Blocks
+        for _ in range(self.num_layers):
+            x = TransformerBlock(
+                d_model=self.d_model, 
+                num_heads=self.num_heads, 
+                mlp_dim=self.mlp_dim, 
+                use_relu=self.use_relu
+            )(x)
+            
+        # 5. Output Extraction
+        # Extract the processed representation of the [CLS] token (index 0)
+        cls_out = x[..., 0, :]
+        
+        # 6. Final Layer Projection (identical to original)
+        out = nn.Dense(64, kernel_init=lecun_uniform, bias_init=bias_init)(cls_out)
+        
+        return out
+
 class Actor(nn.Module):
     action_size: int
     norm_type = "layer_norm"
@@ -542,9 +682,15 @@ if __name__ == "__main__":
     )
 
     # Critic
-    sa_encoder = SA_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
+    if args.transformer:
+        sa_encoder = SA_TransformerEncoder(d_model=args.tr_critic_width, num_heads=args.tr_critic_num_heads, mlp_dim=args.tr_critic_mlp_dim, num_layers=args.tr_critic_n_layers, use_relu=args.use_relu)
+    else:
+        sa_encoder = SA_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-    g_encoder = G_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
+    if args.transformer:
+        g_encoder = G_TransformerEncoder(d_model=args.tr_critic_width, num_heads=args.tr_critic_num_heads, mlp_dim=args.tr_critic_mlp_dim, num_layers=args.tr_critic_n_layers, use_relu=args.use_relu)
+    else:
+        g_encoder = G_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
     g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
     
     critic_state = TrainState.create(

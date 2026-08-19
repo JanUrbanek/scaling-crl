@@ -79,6 +79,8 @@ class Args:
     tr_critic_mlp_dim: int = 1024
     tr_critic_n_layers: int = 4
     
+    group_tokens_file: Optional[str] = None
+
     num_episodes_per_env: int = 1 #recommended to keep at 1
     training_steps_multiplier: int = 1 #recommended to keep at 1
     use_all_batches: int = 0 # recommended to keep at 0
@@ -230,41 +232,69 @@ class TransformerBlock(nn.Module):
         
         return x
 
+def parse_group_indices(grouping: Tuple[int, ...]) -> List[List[int]]:
+    """Helper to group feature indices by their group ID."""
+    unique_groups = sorted(list(set(grouping)))
+    return [[i for i, g_id in enumerate(grouping) if g_id == g] for g in unique_groups]
+
 class SA_TransformerEncoder(nn.Module):
     d_model: int = 512
     num_heads: int = 8
     num_layers: int = 1
     mlp_dim: int = 2048
     use_relu: int = 0
-    
+    # Pass a tuple mapping each state index to a group number, e.g. (0, 0, 1, 1, 2)
+    grouping: Optional[Tuple[int, ...]] = None  
+
     @nn.compact
     def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
         lecun_uniform = variance_scaling(1/3, "fan_in", "uniform")
         bias_init = nn.initializers.zeros
         
-        # 1. Project states and actions into a shared dimensional space
-        s_proj = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init)(s)
-        a_proj = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init)(a)
-        
-        # Expand dims to create sequence axes: (..., 1, d_model)
-        s_seq = jnp.expand_dims(s_proj, axis=-2)
-        a_seq = jnp.expand_dims(a_proj, axis=-2)
-        
-        # 2. Setup the [CLS] Token
-        # Extract batch dimensions to properly broadcast the learned token
-        batch_shape = s_seq.shape[:-2]
+        # 1. State Tokenization
+        if self.grouping is None:
+            # Default behavior: Single state token
+            s_proj = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init, name="s_proj")(s)
+            s_tokens = jnp.expand_dims(s_proj, axis=-2) # Shape: (..., 1, d_model)
+        else:
+            # Grouped behavior: Multi-token state projection
+            group_indices = parse_group_indices(self.grouping)
+            s_token_list = []
+            
+            for idx, indices in enumerate(group_indices):
+                # Slice features corresponding to group `idx`
+                s_group = s[..., jnp.array(indices)]
+                # Unique dense layer for each group to handle variable group dimensions
+                s_proj_i = nn.Dense(
+                    self.d_model, 
+                    kernel_init=lecun_uniform, 
+                    bias_init=bias_init, 
+                    name=f"s_proj_group_{idx}"
+                )(s_group)
+                s_token_list.append(s_proj_i)
+            
+            # Stack along sequence dimension -> Shape: (..., N_groups, d_model)
+            s_tokens = jnp.stack(s_token_list, axis=-2)
+
+        # 2. Action Tokenization
+        a_proj = nn.Dense(self.d_model, kernel_init=lecun_uniform, bias_init=bias_init, name="a_proj")(a)
+        a_tokens = jnp.expand_dims(a_proj, axis=-2) # Shape: (..., 1, d_model)
+
+        # 3. [CLS] Token Setup
+        batch_shape = s.shape[:-1]
         cls_token = self.param('cls_token', nn.initializers.zeros, (1, 1, self.d_model))
         cls_token = jnp.broadcast_to(cls_token, (*batch_shape, 1, self.d_model))
-        
-        # Concatenate into sequence: (..., 3, d_model) -> [CLS, state, action]
-        x = jnp.concatenate([cls_token, s_seq, a_seq], axis=-2)
-        
-        # 3. Add Positional Embeddings
-        # Crucial so the transformer can distinguish between the state and action token
-        pos_emb = self.param('pos_emb', nn.initializers.normal(stddev=0.02), (1, 3, self.d_model))
+
+        # 4. Assemble Sequence: [CLS, s_group_0, s_group_1, ..., action]
+        x = jnp.concatenate([cls_token, s_tokens, a_tokens], axis=-2)
+
+        # 5. Dynamic Positional Embedding
+        # Sequence length resolves automatically (3 when grouping=None, 2 + N_groups otherwise)
+        seq_len = x.shape[-2]
+        pos_emb = self.param('pos_emb', nn.initializers.normal(stddev=0.02), (1, seq_len, self.d_model))
         x = x + pos_emb
-        
-        # 4. Apply Transformer Blocks
+
+        # 6. Apply Transformer Blocks
         for _ in range(self.num_layers):
             x = TransformerBlock(
                 d_model=self.d_model, 
@@ -272,14 +302,10 @@ class SA_TransformerEncoder(nn.Module):
                 mlp_dim=self.mlp_dim, 
                 use_relu=self.use_relu
             )(x)
-            
-        # 5. Output Extraction
-        # Extract the processed representation of the [CLS] token (index 0)
+
+        # 7. Extract [CLS] Token and Project Output
         cls_out = x[..., 0, :]
-        
-        # 6. Final Layer Projection (identical to original)
         out = nn.Dense(64, kernel_init=lecun_uniform, bias_init=bias_init)(cls_out)
-        
         return out
 
 class G_TransformerEncoder(nn.Module):
@@ -400,6 +426,12 @@ def save_params(path: str, params: Any):
     """Saves parameters in flax format."""
     with epath.Path(path).open('wb') as fout:
         fout.write(pickle.dumps(params))
+
+def get_grouping_from_file(file_path: str | None) -> Tuple[int, ...] | None:
+    if file_path is None:
+        return None
+    with open(file_path, "r", encoding="utf-8") as file:
+        return tuple(int(line.strip()) for line in file if line.strip())
 
 if __name__ == "__main__":
 
@@ -682,8 +714,9 @@ if __name__ == "__main__":
     )
 
     # Critic
+    group_tokens = get_grouping_from_file(args.group_tokens_file)
     if args.transformer:
-        sa_encoder = SA_TransformerEncoder(d_model=args.tr_critic_width, num_heads=args.tr_critic_num_heads, mlp_dim=args.tr_critic_mlp_dim, num_layers=args.tr_critic_n_layers, use_relu=args.use_relu)
+        sa_encoder = SA_TransformerEncoder(d_model=args.tr_critic_width, num_heads=args.tr_critic_num_heads, mlp_dim=args.tr_critic_mlp_dim, num_layers=args.tr_critic_n_layers, use_relu=args.use_relu, grouping=group_tokens)
     else:
         sa_encoder = SA_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
     sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))

@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from brax import envs
 from etils import epath
 from dataclasses import dataclass
-from typing import NamedTuple, Any
+from typing import NamedTuple, Any, Optional
 from wandb_osh.hooks import TriggerWandbSyncHook
 from flax.training.train_state import TrainState
 from flax.linen.initializers import variance_scaling

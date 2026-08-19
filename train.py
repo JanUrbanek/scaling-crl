@@ -232,7 +232,7 @@ class TransformerBlock(nn.Module):
         
         return x
 
-def parse_group_indices(grouping: tuple[int, ...]) -> List[List[int]]:
+def parse_group_indices(grouping: tuple[int, ...]) -> list[list[int]]:
     """Helper to group feature indices by their group ID."""
     unique_groups = sorted(list(set(grouping)))
     return [[i for i, g_id in enumerate(grouping) if g_id == g] for g in unique_groups]

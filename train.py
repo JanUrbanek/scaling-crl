@@ -232,7 +232,7 @@ class TransformerBlock(nn.Module):
         
         return x
 
-def parse_group_indices(grouping: Tuple[int, ...]) -> List[List[int]]:
+def parse_group_indices(grouping: tuple[int, ...]) -> List[List[int]]:
     """Helper to group feature indices by their group ID."""
     unique_groups = sorted(list(set(grouping)))
     return [[i for i, g_id in enumerate(grouping) if g_id == g] for g in unique_groups]
@@ -244,7 +244,7 @@ class SA_TransformerEncoder(nn.Module):
     mlp_dim: int = 2048
     use_relu: int = 0
     # Pass a tuple mapping each state index to a group number, e.g. (0, 0, 1, 1, 2)
-    grouping: Optional[Tuple[int, ...]] = None  
+    grouping: Optional[tuple[int, ...]] = None  
 
     @nn.compact
     def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
@@ -427,7 +427,7 @@ def save_params(path: str, params: Any):
     with epath.Path(path).open('wb') as fout:
         fout.write(pickle.dumps(params))
 
-def get_grouping_from_file(file_path: str | None) -> Tuple[int, ...] | None:
+def get_grouping_from_file(file_path: str | None) -> tuple[int, ...] | None:
     if file_path is None:
         return None
     with open(file_path, "r", encoding="utf-8") as file:
